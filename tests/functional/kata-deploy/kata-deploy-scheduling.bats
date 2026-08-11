@@ -631,204 +631,29 @@ EOF
 	# would silently skip every tainted node.
 	echo "${install}" | grep -q "key: node-role.kubernetes.io/control-plane"
 	echo "${install}" | grep -q "operator: Exists"
-	echo "${cleanup}" | grep -q "key: node-role.kubernetes.io/control-plane"
+
+	# Cleanup goes the other way and tolerates everything, because it selects nodes
+	# by what was installed on them rather than by where it may run
+	# (--ignore-node-taints): a taint added after the install must not be able to
+	# leave a node with Kata on it that no uninstall can reach.
+	refute_match "${cleanup}" "key: node-role.kubernetes.io/control-plane"
+	echo "${cleanup}" | grep -q -- "- operator: Exists"
 }
 
-@test "Helm template (job mode): uninstall targets labeled nodes and ignores taints" {
-	local rendered
-	rendered=$(helm template kata-deploy "${CHART_PATH}" \
-		--set deploymentMode=job \
-		--set nodeSelector.kata-containers=enabled \
-		--show-only templates/kata-deploy-cleanup-job.yaml)
+@test "Helm template (job mode): install Jobs tolerate what a DaemonSet pod tolerates" {
+	# The DaemonSet controller adds these to every DaemonSet pod, and the dispatcher
+	# admits the nodes a DaemonSet would, so the Jobs have to survive there for the
+	# same reasons. not-ready in particular: restarting the CRI runtime is what the
+	# install does, and it takes the node NotReady long enough for the taint manager
+	# to evict a pod that does not tolerate it.
+	render_job_templates
 
-	# Cleanup must reach every node the install labeled, so it is neither
-	# narrowed by the top-level nodeSelector nor blocked by taints added since.
-	echo "${rendered}" | grep -q -- '--node-selector=katacontainers.io/kata-runtime'
-	refute_match "${rendered}" 'kata-containers=enabled'
-	echo "${rendered}" | grep -q -- '--ignore-node-taints'
-}
+	local install taint
+	install=$(extract_pernode_job install)
 
-@test "Helm template (job mode): job.nodes wins over the compiled selection" {
-	local rendered
-	rendered=$(helm template kata-deploy "${CHART_PATH}" \
-		--set deploymentMode=job \
-		--set nodeSelector.kata-containers=enabled \
-		--set 'job.nodes[0]=worker-1' \
-		--set 'job.nodes[1]=worker-2' \
-		--show-only templates/kata-deploy-install-job.yaml)
-
-	echo "${rendered}" | grep -q -- '--nodes=worker-1,worker-2'
-	refute_match "${rendered}" '--node-selector='
-}
-
-@test "Helm template (job mode): install waits for nodes to become eligible" {
-	local rendered
-	rendered=$(helm template kata-deploy "${CHART_PATH}" \
-		--set deploymentMode=job \
-		--show-only templates/kata-deploy-install-job.yaml)
-
-	# The dispatcher runs once, but eligibility arrives late: the labels the
-	# selection matches are written by NFD, which starts with this very release.
-	# Resolving nodes off the first snapshot would install nowhere and exit 0.
-	echo "${rendered}" | grep -q -- '--wait-for-nodes-secs=120'
-
-	rendered=$(helm template kata-deploy "${CHART_PATH}" \
-		--set deploymentMode=job \
-		--set job.waitForNodesSeconds=0 \
-		--show-only templates/kata-deploy-install-job.yaml)
-
-	echo "${rendered}" | grep -q -- '--wait-for-nodes-secs=0'
-}
-
-@test "Helm template (job mode): named nodes and uninstall never wait" {
-	local install cleanup
-	install=$(helm template kata-deploy "${CHART_PATH}" \
-		--set deploymentMode=job \
-		--set 'job.nodes[0]=worker-1' \
-		--show-only templates/kata-deploy-install-job.yaml)
-	cleanup=$(helm template kata-deploy "${CHART_PATH}" \
-		--set deploymentMode=job \
-		--show-only templates/kata-deploy-cleanup-job.yaml)
-
-	# Named nodes need no discovery, and uninstall must not stall for two
-	# minutes on a release that never labeled a node in the first place.
-	refute_match "${install}" '--wait-for-nodes-secs'
-	refute_match "${cleanup}" '--wait-for-nodes-secs'
-}
-
-# =============================================================================
-# Node-selection validation (one source of truth)
-# =============================================================================
-
-@test "Helm template: nodeSelector and nodeAffinity are ANDed, as Kubernetes does" {
-	local values_file
-	values_file=$(mktemp)
-	cat > "${values_file}" <<EOF
-nodeSelector:
-  kata-containers: "enabled"
-affinity:
-  nodeAffinity:
-    requiredDuringSchedulingIgnoredDuringExecution:
-      nodeSelectorTerms:
-        - matchExpressions:
-            - key: kubernetes.io/os
-              operator: In
-              values:
-                - linux
-        - matchExpressions:
-            - key: tee
-              operator: Exists
-EOF
-
-	# Daemonset mode hands both to the scheduler untouched and lets Kubernetes
-	# AND them, which is the behaviour job mode has to reproduce.
-	render_chart -f "${values_file}"
-	local ds
-	ds=$(extract_kata_deploy_ds)
-	echo "${ds}" | grep -q "kata-containers: enabled"
-	echo "${ds}" | grep -q "nodeAffinity:"
-
-	# Job mode folds the nodeSelector equalities into EVERY term, which is the
-	# same node set by distribution: eq AND (t1 OR t2) == (eq AND t1) OR (eq AND t2).
-	local selectors
-	selectors=$(dispatcher_selectors install -f "${values_file}")
-	rm -f "${values_file}"
-
-	[[ "$(echo "${selectors}" | wc -l)" -eq 2 ]]
-	echo "${selectors}" | grep -qx 'kata-containers=enabled,kubernetes.io/os in (linux)'
-	echo "${selectors}" | grep -qx 'kata-containers=enabled,tee'
-}
-
-@test "Helm template: nodeSelector combined with podAntiAffinity is allowed" {
-	run helm template kata-deploy "${CHART_PATH}" \
-		--set deploymentMode=daemonset \
-		--set nodeSelector.kata-containers=enabled \
-		--set 'affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution[0].topologyKey=kubernetes.io/hostname'
-
-	[ "${status}" -eq 0 ]
-}
-
-@test "Helm template: removed job-mode selection keys fail with a migration hint" {
-	run helm template kata-deploy "${CHART_PATH}" --set deploymentMode=job \
-		--set job.nodeSelector.kata-containers=enabled
-	[ "${status}" -ne 0 ]
-	echo "${output}" | grep -q "job.nodeSelector has been removed"
-
-	run helm template kata-deploy "${CHART_PATH}" --set deploymentMode=job \
-		--set 'job.nodeSelectorExpressions[0].key=kata' \
-		--set 'job.nodeSelectorExpressions[0].operator=Exists'
-	[ "${status}" -ne 0 ]
-	echo "${output}" | grep -q "job.nodeSelectorExpressions has been removed"
-
-	run helm template kata-deploy "${CHART_PATH}" --set deploymentMode=job \
-		--set 'job.cleanup.nodeSelectorExpressions[0].key=kata' \
-		--set 'job.cleanup.nodeSelectorExpressions[0].operator=Exists'
-	[ "${status}" -ne 0 ]
-	echo "${output}" | grep -q "renamed to job.cleanup.nodeAffinity"
-}
-
-@test "Helm template (job mode): rules a node query cannot express are rejected" {
-	run helm template kata-deploy "${CHART_PATH}" --set deploymentMode=job \
-		--set 'affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key=cpus' \
-		--set 'affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].operator=Gt'
-	[ "${status}" -ne 0 ]
-	echo "${output}" | grep -q 'unsupported operator "Gt"'
-
-	run helm template kata-deploy "${CHART_PATH}" --set deploymentMode=job \
-		--set 'affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchFields[0].key=metadata.name' \
-		--set 'affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchFields[0].operator=In'
-	[ "${status}" -ne 0 ]
-	echo "${output}" | grep -q "matchFields cannot be used"
-}
-
-@test "Helm template (job mode): the dispatcher can be confined to trusted nodes" {
-	local args=(
-		--set 'job.dispatcherNodeSelector.node-role\.kubernetes\.io/control-plane='
-		--set 'job.dispatcherTolerations[0].key=node-role.kubernetes.io/control-plane'
-		--set 'job.dispatcherTolerations[0].operator=Exists'
-		--set 'job.dispatcherTolerations[0].effect=NoSchedule'
-	)
-
-	# The dispatcher's token is the one that reaches every node in the cluster, so
-	# an operator must be able to keep it off the nodes Kata runs on: root on the
-	# node it lands on can read that token.
-	local stage rendered
-	for stage in install cleanup; do
-		rendered=$(helm template kata-deploy "${CHART_PATH}" \
-			--set deploymentMode=job \
-			"${args[@]}" \
-			--show-only "templates/kata-deploy-${stage}-job.yaml")
-		echo "${rendered}" | grep -q 'node-role.kubernetes.io/control-plane: ""'
-		echo "${rendered}" | grep -q 'key: node-role.kubernetes.io/control-plane'
+	for taint in not-ready unreachable disk-pressure memory-pressure pid-pressure unschedulable; do
+		echo "${install}" | grep -q "key: node.kubernetes.io/${taint}"
 	done
-
-	# Where the dispatcher may run says nothing about where Kata is installed: the
-	# per-node Jobs must not inherit its placement, or pinning the dispatcher to
-	# the control plane would quietly stop installing on the workers.
-	local jobs
-	jobs=$(helm template kata-deploy "${CHART_PATH}" \
-		--set deploymentMode=job \
-		"${args[@]}" \
-		--show-only templates/kata-deploy-job-templates.yaml)
-	# Spelled out rather than `! ... grep`, whose return value bash leaves out of
-	# set -e: as anything but the last line of a test, it cannot fail it.
-	if echo "${jobs}" | grep -q 'node-role.kubernetes.io/control-plane'; then
-		echo "per-node Jobs inherited the dispatcher's placement" >&2
-		return 1
-	fi
-}
-
-@test "Helm template (job mode): dispatcher tolerations default to the top-level ones" {
-	local rendered
-	rendered=$(helm template kata-deploy "${CHART_PATH}" \
-		--set deploymentMode=job \
-		--set 'tolerations[0].operator=Exists' \
-		--show-only templates/kata-deploy-install-job.yaml)
-
-	# Without this fallback a cluster whose every node is tainted - a single-node
-	# cluster, say - would select nodes it has nowhere to dispatch from.
-	echo "${rendered}" | grep -q 'tolerations:'
-	echo "${rendered}" | grep -q 'operator: Exists'
 }
 
 @test "Helm template (job mode): a per-node Job cannot run forever" {
