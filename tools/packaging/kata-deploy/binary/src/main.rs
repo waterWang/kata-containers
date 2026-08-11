@@ -72,13 +72,18 @@ enum Action {
     /// runtime, and wait for node readiness.
     #[clap(name = "install-stage-cri")]
     InstallStageCri,
-    /// Stage 3 of a staged (JobSet) install: apply the kata-runtime node label.
-    /// Unprivileged, Kubernetes API only.
+    /// Apply the kata-runtime node label. Unprivileged, Kubernetes API only.
+    ///
+    /// No longer part of the staged pipeline: the dispatcher labels the node
+    /// itself, once the node's Job as a whole succeeded, which is what lets those
+    /// Jobs run with no ServiceAccount token. Kept because a chart from before
+    /// that change still invokes it.
     #[clap(name = "install-stage-label")]
     InstallStageLabel,
-    /// Cleanup stage 1 of a staged (JobSet) uninstall: remove the kata-runtime
-    /// node label first so the scheduler stops placing kata workloads here.
-    /// Unprivileged, Kubernetes API only.
+    /// Remove the kata-runtime node label. Unprivileged, Kubernetes API only.
+    ///
+    /// As with install-stage-label, the dispatcher does this now; kept for older
+    /// charts.
     #[clap(name = "cleanup-stage-unlabel")]
     CleanupStageUnlabel,
     /// Cleanup stage 2 of a staged (JobSet) uninstall: remove CRI drop-ins,
@@ -309,7 +314,7 @@ async fn main() -> Result<()> {
             info!("Install host-check stage completed, exiting");
         }
         Action::InstallStageArtifacts => {
-            install_stage_artifacts(&config, &runtime).await?;
+            install_stage_artifacts(&config, &runtime, true).await?;
             info!("Install artifacts stage completed, exiting");
         }
         Action::InstallStageCri => {
@@ -371,7 +376,7 @@ async fn install(config: &config::Config, runtime: &str) -> Result<()> {
     info!("Installing Kata Containers");
 
     install_stage_host_check(config, runtime, false).await?;
-    install_stage_artifacts(config, runtime).await?;
+    install_stage_artifacts(config, runtime, false).await?;
     install_stage_cri(config, runtime, false).await?;
     install_stage_label(config).await?;
 
@@ -785,6 +790,11 @@ fn mapping_contains_value(mapping: Option<&str>, expected_value: &str) -> bool {
 /// Best-effort: this guards a failure that may never happen, and refusing to
 /// install over one failed label write would trade a rare orphan for a common
 /// outage.
+/// Mark the node as being installed on, so an install that dies before labelling
+/// it still leaves something for `helm uninstall` to find.
+///
+/// Staged runs have no credentials for this, and no need of them: their dispatcher
+/// claims the node before it creates the Job.
 async fn claim_node(config: &config::Config) {
     if let Err(e) = k8s::label_node(
         config,
@@ -804,10 +814,16 @@ async fn claim_node(config: &config::Config) {
 
 /// Install stage 1 (artifacts): place kata artifacts/config on the host and set
 /// up any configured snapshotters. This does not touch CRI configuration.
-async fn install_stage_artifacts(config: &config::Config, runtime: &str) -> Result<()> {
+async fn install_stage_artifacts(
+    config: &config::Config,
+    runtime: &str,
+    staged: bool,
+) -> Result<()> {
     info!("install (artifacts): installing kata artifacts on host");
 
-    claim_node(config).await;
+    if !staged {
+        claim_node(config).await;
+    }
 
     artifacts::install_artifacts(config, runtime).await?;
 
@@ -885,29 +901,14 @@ async fn install_stage_cri(config: &config::Config, runtime: &str, staged: bool)
             if unchanged
                 && runtime::lifecycle::cri_serving_config_from(runtime, before.written_at()).await
             {
-                // Everything up to here is inference about a pod no longer around
-                // to ask. The node seeing our handlers is the one direct answer.
-                let report =
-                    runtime::lifecycle::kata_handlers_loaded(config, &handlers, HANDLER_WAIT_SECS)
-                        .await;
-
-                if let runtime::lifecycle::HandlerReport::Missing(missing) = report {
-                    info!(
-                        "install (cri): {runtime} has been up since this config was written, but \
-                         node {} still does not report {missing:?}, so it is not serving it after \
-                         all. Restarting.",
-                        config.node_name
-                    );
-                } else {
-                    info!(
-                        "install (cri): CRI config for {runtime} is unchanged from a previous \
-                         attempt, and {runtime} is already serving it. Skipping the \
-                         (self-terminating) restart and checking the runtime is up instead."
-                    );
-                    runtime::lifecycle::wait_till_cri_unit_active(runtime, 300).await?;
-                    info!("install (cri): runtime is up; CRI stage complete without restart");
-                    return Ok(());
-                }
+                info!(
+                    "install (cri): CRI config for {runtime} is unchanged from a previous \
+                     attempt, and {runtime} has been up since it was written. Skipping the \
+                     (self-terminating) restart and checking the runtime is up instead."
+                );
+                runtime::lifecycle::wait_till_cri_unit_active(runtime, 300).await?;
+                info!("install (cri): runtime is up; CRI stage complete without restart");
+                return Ok(());
             }
         }
     }
@@ -915,6 +916,20 @@ async fn install_stage_cri(config: &config::Config, runtime: &str, staged: bool)
     info!("About to restart runtime: {}", runtime);
     runtime::lifecycle::restart_runtime(config, runtime, staged).await?;
     info!("Runtime restart completed successfully");
+
+    if staged {
+        // Whether the runtime is *serving* what was written is a question only the
+        // node can answer, and asking needs the apiserver. The dispatcher asks it
+        // before labelling the node, so a runtime that ignored this configuration
+        // still fails the node - just from outside, where the credentials are.
+        if !handlers.is_empty() {
+            info!(
+                "install (cri): leaving the check that {runtime} is serving {handlers:?} to the \
+                 dispatcher, which can ask the node"
+            );
+        }
+        return Ok(());
+    }
 
     confirm_handlers_are_served(config, runtime, &handlers).await
 }
