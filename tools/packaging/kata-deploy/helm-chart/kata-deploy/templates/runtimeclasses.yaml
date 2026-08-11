@@ -132,6 +132,9 @@ overhead:
 scheduling:
   nodeSelector:
     katacontainers.io/kata-runtime: "true"
+{{- with include "kata-deploy.instanceMarkerLabel" .root }}
+    {{ . }}: "true"
+{{- end }}
 {{- /* TEE shims: snp, tdx, -se, -se-runtime-rs (SE = IBM Secure Execution / SEL) */ -}}
 {{- $isTeeShim := or (contains "snp" .shim) (contains "tdx" .shim) (hasSuffix "-se" .shim) (hasSuffix "-se-runtime-rs" .shim) -}}
 {{- $isPureTeeShim := and $isTeeShim (not (contains "nvidia-gpu" .shim)) -}}

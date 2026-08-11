@@ -771,8 +771,30 @@ that is about to lose its runtime.
 
 Arguments (dict): root, stage. Emitted at column 0; `nindent` at the call site.
 */}}
+{{/*
+The label key this install marks its nodes with: the per-install half of the
+scheduling gate.
+
+katacontainers.io/kata-runtime is shared by every install on the node, so it
+cannot say *which* install is serving Kata there. With multiInstallSuffix set, the
+RuntimeClasses of an install therefore select this mark as well: taking it away is
+then what stops that install's workloads reaching the node, while the other
+installs keep theirs.
+*/}}
+{{- define "kata-deploy.instanceMarkerLabel" -}}
+{{- if .Values.env.multiInstallSuffix -}}
+kata-deploy.katacontainers.io/{{ .Values.env.multiInstallSuffix }}
+{{- end -}}
+{{- end -}}
+
 {{- define "kata-deploy.dispatcherNodeWorkFlags" -}}
 {{- $root := .root -}}
+{{- /* Installs share katacontainers.io/kata-runtime, so each one marks the nodes
+       it holds with a label of its own and only takes the shared one away once no
+       other mark is left. Both stages need to know which mark is ours. */}}
+{{- with $root.Values.env.multiInstallSuffix }}
+- "--multi-install-suffix={{ . }}"
+{{- end }}
 {{- if eq .stage "cleanup" }}
 - "--remove-node-label"
 {{- else }}
