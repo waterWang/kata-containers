@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use flate2::read::GzDecoder;
 use log::{error, info};
+use std::collections::BTreeMap;
 use std::io::BufRead;
 
 /// Env var name used to thread the detected container runtime through the
@@ -107,6 +108,14 @@ const KATA_RUNTIME_LABEL: &str = "katacontainers.io/kata-runtime";
 /// The value [`KATA_RUNTIME_LABEL`] carries while an install is under way: this
 /// node has to be cleaned up, but cannot run kata workloads yet.
 const KATA_RUNTIME_PENDING: &str = "false";
+/// Every install also marks the nodes it holds with a label of its own, named
+/// after its `MULTI_INSTALL_SUFFIX`. [`KATA_RUNTIME_LABEL`] is shared by all of
+/// them - the RuntimeClasses of every install select it - so an uninstall would
+/// otherwise have no way of telling whether taking it away leaves another
+/// install's workloads with nowhere to run.
+const INSTANCE_LABEL_PREFIX: &str = "kata-deploy.katacontainers.io/";
+/// The instance name of an install that set no `MULTI_INSTALL_SUFFIX`.
+const DEFAULT_INSTANCE: &str = "default";
 const SUGGESTED_KUBELET_RUNTIME_REQUEST_TIMEOUT_SECS: u64 = 10 * 60;
 const MKFS_EROFS: &str = "mkfs.erofs";
 const MIN_EROFS_UTILS_VERSION: &str = "1.8.2";
@@ -777,38 +786,140 @@ fn mapping_contains_value(mapping: Option<&str>, expected_value: &str) -> bool {
     })
 }
 
-/// Mark the node as one kata-deploy has started installing on, before anything
-/// is written to it.
+/// The marker label of one install.
+fn instance_label(suffix: Option<&str>) -> String {
+    format!(
+        "{INSTANCE_LABEL_PREFIX}{}",
+        suffix.unwrap_or(DEFAULT_INSTANCE)
+    )
+}
+
+/// What another install's marks on a node say about the label they share.
+#[derive(Debug, PartialEq, Eq)]
+enum SharedLabel {
+    /// Another install is serving Kata here: the shared label stays `true`.
+    Keep,
+    /// Another install has claimed this node but not finished on it. Nothing may be
+    /// scheduled on the strength of the shared label, but the key has to stay so
+    /// that install's own uninstall can still find the node.
+    Demote,
+    /// Ours was the last mark: the key goes.
+    Remove,
+}
+
+/// Read the marks other installs left on a node.
 ///
-/// `helm uninstall` cleans the nodes carrying the kata-runtime label, whatever
-/// its value, so a node labelled only once the install *finishes* is out of
-/// uninstall's reach for the whole time it is half-installed. Not `true`,
-/// because RuntimeClasses select that exact value; an existing label is left
-/// alone, so reinstalling over a working node cannot withdraw it from
-/// scheduling.
+/// The *value* is what matters, not just the key: a `false` mark is a claim on a
+/// node an install has not finished with, and treating it as "someone is serving
+/// Kata here" would leave the node advertised with nothing behind the
+/// advertisement.
+fn shared_label_after(labels: &BTreeMap<String, String>, ours: &str) -> SharedLabel {
+    let mut any = false;
+    for (key, value) in labels {
+        if key == ours || !key.starts_with(INSTANCE_LABEL_PREFIX) {
+            continue;
+        }
+        any = true;
+        if value != KATA_RUNTIME_PENDING {
+            return SharedLabel::Keep;
+        }
+    }
+
+    if any {
+        SharedLabel::Demote
+    } else {
+        SharedLabel::Remove
+    }
+}
+
+/// Take this install's mark off the node, and the label it shares with every other
+/// install with it, unless another install is still holding the node. Returns
+/// whether one is.
+async fn release_node(config: &config::Config) -> Result<bool> {
+    let ours = instance_label(config.multi_install_suffix.as_deref());
+
+    // A node nothing has marked was installed on by a version that did not mark it,
+    // so ask the question that version asked: is any other kata-deploy left in the
+    // cluster at all?
+    let labels = k8s::get_node_labels(config).await?;
+    let unmarked =
+        !labels.contains_key(&ours) && shared_label_after(&labels, &ours) == SharedLabel::Remove;
+    let legacy_others = unmarked && k8s::count_any_kata_deploy_daemonsets(config).await? > 0;
+
+    let others = k8s::rewrite_node_labels(config, |labels| {
+        let mut updates: Vec<(String, Option<String>)> = Vec::new();
+        if labels.contains_key(&ours) {
+            updates.push((ours.clone(), None));
+        }
+
+        let verdict = if legacy_others {
+            SharedLabel::Keep
+        } else {
+            shared_label_after(labels, &ours)
+        };
+
+        match verdict {
+            SharedLabel::Keep => (),
+            SharedLabel::Demote => {
+                if labels.get(KATA_RUNTIME_LABEL).map(String::as_str) != Some(KATA_RUNTIME_PENDING)
+                {
+                    updates.push((
+                        KATA_RUNTIME_LABEL.to_string(),
+                        Some(KATA_RUNTIME_PENDING.to_string()),
+                    ));
+                }
+            }
+            SharedLabel::Remove => {
+                if labels.contains_key(KATA_RUNTIME_LABEL) {
+                    updates.push((KATA_RUNTIME_LABEL.to_string(), None));
+                }
+            }
+        }
+
+        (updates, verdict)
+    })
+    .await?;
+
+    match others {
+        SharedLabel::Keep => info!(
+            "another kata-deploy install is still serving Kata from this node, leaving {} in place",
+            KATA_RUNTIME_LABEL
+        ),
+        SharedLabel::Demote => info!(
+            "another kata-deploy install has claimed this node but has not finished installing on \
+             it, so {} stays as {}",
+            KATA_RUNTIME_LABEL, KATA_RUNTIME_PENDING
+        ),
+        SharedLabel::Remove => info!("removed {} from this node", KATA_RUNTIME_LABEL),
+    }
+
+    Ok(others != SharedLabel::Remove)
+}
+
+/// Mark the node as one kata-deploy has started installing on, before anything is
+/// written to it.
 ///
-/// Best-effort: this guards a failure that may never happen, and refusing to
-/// install over one failed label write would trade a rare orphan for a common
-/// outage.
-/// Mark the node as being installed on, so an install that dies before labelling
-/// it still leaves something for `helm uninstall` to find.
+/// `helm uninstall` cleans the nodes carrying the kata-runtime label, whatever its
+/// value, so a node labelled only once the install *finishes* is out of uninstall's
+/// reach for the whole time it is half-installed. Not `true`, because RuntimeClasses
+/// select that exact value; an existing label is left alone, so reinstalling over a
+/// working node cannot withdraw it from scheduling.
+///
+/// Best-effort: this guards a failure that may never happen, and refusing to install
+/// over one failed label write would trade a rare orphan for a common outage.
 ///
 /// Staged runs have no credentials for this, and no need of them: their dispatcher
 /// claims the node before it creates the Job.
 async fn claim_node(config: &config::Config) {
-    if let Err(e) = k8s::label_node(
-        config,
-        KATA_RUNTIME_LABEL,
-        Some(KATA_RUNTIME_PENDING),
-        false,
-    )
-    .await
-    {
-        log::warn!(
-            "install: could not mark node {} as being installed on ({e}). Should this install \
-             fail before it labels the node, `helm uninstall` will not clean this node up.",
-            config.node_name
-        );
+    let ours = instance_label(config.multi_install_suffix.as_deref());
+    for key in [KATA_RUNTIME_LABEL, ours.as_str()] {
+        if let Err(e) = k8s::label_node(config, key, Some(KATA_RUNTIME_PENDING), false).await {
+            log::warn!(
+                "install: could not mark node {} as being installed on ({e}). Should this install \
+                 fail before it labels the node, `helm uninstall` will not clean this node up.",
+                config.node_name
+            );
+        }
     }
 }
 
@@ -990,18 +1101,25 @@ async fn confirm_handlers_are_served(
 async fn install_stage_label(config: &config::Config) -> Result<()> {
     info!("install (label): applying node label");
 
-    match k8s::get_node_label(config, KATA_RUNTIME_LABEL).await {
-        Ok(Some(ref val)) if val == "true" => {
-            info!(
-                "install (label): node already labeled {}=true, skipping",
-                KATA_RUNTIME_LABEL
-            );
+    // The shared label admits Kata workloads to the node; our own mark is what the
+    // RuntimeClasses of *this* install select on top of it, and what tells another
+    // install's uninstall that the shared label is not its to remove. A kubelet
+    // that clobbers either of them leaves the node unusable, so both are applied
+    // and both have to be seen to hold.
+    let ours = instance_label(config.multi_install_suffix.as_deref());
+    let wanted = [(KATA_RUNTIME_LABEL, "true"), (ours.as_str(), "true")];
+
+    match k8s::get_node_labels(config).await {
+        Ok(labels)
+            if wanted
+                .iter()
+                .all(|(key, value)| labels.get(*key).map(String::as_str) == Some(*value)) =>
+        {
+            info!("install (label): node is already labelled, skipping");
         }
-        // Any other state (absent, different value, or a transient read error)
+        // Any other state (absent, a different value, or a transient read error)
         // falls through to label_node_with_retry, which applies and verifies.
-        _ => {
-            label_node_with_retry(config, KATA_RUNTIME_LABEL, "true").await?;
-        }
+        _ => label_node_with_retry(config, &wanted).await?,
     }
 
     remove_startup_taints(config).await;
@@ -1062,27 +1180,30 @@ async fn remove_startup_taints(config: &config::Config) {
 /// confirm the label is set, declare install done, and only then would the kubelet
 /// come back up and clobber the label with its cached set.
 ///
-/// To outlive that race we require the label to remain at `label_value` for
+/// To outlive that race we require every label to remain at its value for
 /// `STABILITY_CHECKS` consecutive observations spaced `CHECK_INTERVAL` apart
 /// (≈ 15 s by default — comfortably more than the kubelet's status-update period).
-/// If it ever drifts inside that window we re-apply and restart the stability
+/// If any of them drifts inside that window we re-apply and restart the stability
 /// counter. The whole thing is bounded by `MAX_APPLY_ATTEMPTS`.
-async fn label_node_with_retry(
-    config: &config::Config,
-    label_key: &str,
-    label_value: &str,
-) -> Result<()> {
+async fn label_node_with_retry(config: &config::Config, labels: &[(&str, &str)]) -> Result<()> {
     const MAX_APPLY_ATTEMPTS: u32 = 12;
     const STABILITY_CHECKS: u32 = 6;
     const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
     const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
+    let described = labels
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
     for attempt in 1..=MAX_APPLY_ATTEMPTS {
-        k8s::label_node(config, label_key, Some(label_value), true).await?;
+        for (key, value) in labels {
+            k8s::label_node(config, key, Some(value), true).await?;
+        }
         info!(
-            "Applied label {}={} (attempt {}/{}); verifying stability ({} checks @ {}s)",
-            label_key,
-            label_value,
+            "Applied label(s) {} (attempt {}/{}); verifying stability ({} checks @ {}s)",
+            described,
             attempt,
             MAX_APPLY_ATTEMPTS,
             STABILITY_CHECKS,
@@ -1094,21 +1215,29 @@ async fn label_node_with_retry(
         while stable_count < STABILITY_CHECKS {
             tokio::time::sleep(CHECK_INTERVAL).await;
 
-            match k8s::get_node_label(config, label_key).await {
-                Ok(Some(val)) if val == label_value => {
-                    stable_count += 1;
-                    info!(
-                        "Label {}={} stable {}/{}",
-                        label_key, label_value, stable_count, STABILITY_CHECKS
-                    );
-                }
-                Ok(actual) => {
+            match k8s::get_node_labels(config).await {
+                Ok(observed) => {
+                    let drifted = labels
+                        .iter()
+                        .filter(|(key, value)| {
+                            observed.get(*key).map(String::as_str) != Some(value)
+                        })
+                        .map(|(key, _)| format!("{key}={:?}", observed.get(*key)))
+                        .collect::<Vec<_>>();
+
+                    if drifted.is_empty() {
+                        stable_count += 1;
+                        info!(
+                            "Label(s) {} stable {}/{}",
+                            described, stable_count, STABILITY_CHECKS
+                        );
+                        continue;
+                    }
+
                     log::warn!(
-                        "Label {}={} drifted to {:?} after {}/{} stable observation(s); \
-                         re-applying (attempt {}/{})",
-                        label_key,
-                        label_value,
-                        actual,
+                        "Label(s) {} drifted after {}/{} stable observation(s); re-applying \
+                         (attempt {}/{})",
+                        drifted.join(", "),
                         stable_count,
                         STABILITY_CHECKS,
                         attempt,
@@ -1119,9 +1248,9 @@ async fn label_node_with_retry(
                 }
                 Err(e) => {
                     log::warn!(
-                        "Failed to verify label {} during stability check \
+                        "Failed to verify label(s) {} during stability check \
                          (attempt {}/{}): {}; will re-apply",
-                        label_key,
+                        described,
                         attempt,
                         MAX_APPLY_ATTEMPTS,
                         e,
@@ -1134,8 +1263,8 @@ async fn label_node_with_retry(
 
         if !needs_reapply {
             info!(
-                "Label {}={} confirmed stable on node after {} apply attempt(s)",
-                label_key, label_value, attempt
+                "Label(s) {} confirmed stable on node after {} apply attempt(s)",
+                described, attempt
             );
             return Ok(());
         }
@@ -1146,9 +1275,8 @@ async fn label_node_with_retry(
     }
 
     anyhow::bail!(
-        "Label {}={} did not remain stable after {} apply attempts",
-        label_key,
-        label_value,
+        "Label(s) {} did not remain stable after {} apply attempts",
+        described,
         MAX_APPLY_ATTEMPTS
     );
 }
@@ -1204,24 +1332,16 @@ async fn cleanup(config: &config::Config, runtime: &str) -> Result<()> {
     artifacts::remove_artifacts(config).await?;
     info!("Successfully removed kata artifacts");
 
-    // Step 3: Check if ANY other kata-deploy DaemonSets still exist.
-    // Shared resources (node label, CRI restart) are only safe to touch
-    // when no other kata-deploy instance remains.
-    let other_ds_count = k8s::count_any_kata_deploy_daemonsets(config).await?;
-    if other_ds_count > 0 {
-        info!(
-            "{} other kata-deploy DaemonSet(s) still exist, \
-             skipping node label removal and CRI restart",
-            other_ds_count
-        );
+    // Step 3: the node label and the CRI restart are shared with every other
+    // install, so they are only safe to touch once no other install holds THIS
+    // node - which is what each install's own mark on it answers.
+    info!("Removing this install's node labels");
+    if release_node(config).await? {
+        info!("Skipping the CRI restart, another install is still using it");
         return Ok(());
     }
 
-    info!("No other kata-deploy DaemonSets found, performing full shared cleanup");
-
-    info!("Removing kata-runtime label from node");
-    k8s::label_node(config, KATA_RUNTIME_LABEL, None, false).await?;
-    info!("Successfully removed kata-runtime label");
+    info!("No other kata-deploy install holds this node, performing full shared cleanup");
 
     // Restart the CRI runtime last. On k3s/rke2 this restarts the entire
     // server process, which kills this (terminating) pod. By doing it after
@@ -1240,19 +1360,7 @@ async fn cleanup(config: &config::Config, runtime: &str) -> Result<()> {
 async fn cleanup_stage_unlabel(config: &config::Config) -> Result<()> {
     info!("cleanup (unlabel): removing node label");
 
-    // If the label is already absent, there is nothing to do. Any other state
-    // (present, or unknown due to a transient read error) falls through to the
-    // removal below.
-    if let Ok(None) = k8s::get_node_label(config, KATA_RUNTIME_LABEL).await {
-        info!(
-            "cleanup (unlabel): label {} already absent, skipping",
-            KATA_RUNTIME_LABEL
-        );
-        return Ok(());
-    }
-
-    k8s::label_node(config, KATA_RUNTIME_LABEL, None, false).await?;
-    info!("cleanup (unlabel): label removed");
+    release_node(config).await?;
     Ok(())
 }
 
@@ -1346,7 +1454,14 @@ async fn cri_drop_in_present(config: &config::Config, runtime: &str) -> bool {
 async fn reset(config: &config::Config, runtime: &str) -> Result<()> {
     info!("Resetting Kata Containers");
 
-    k8s::label_node(config, KATA_RUNTIME_LABEL, None, false).await?;
+    // Restarting the CRI runtime, and the kubelet with it, is shared with every
+    // other install on this node, so it waits until none is left - the same rule
+    // cleanup follows.
+    if release_node(config).await? {
+        info!("Skipping the CRI restart, another install is still using it");
+        return Ok(());
+    }
+
     runtime::lifecycle::restart_cri_runtime(config, runtime).await?;
     if matches!(runtime, "crio" | "containerd") {
         utils::host_systemctl(&["restart", "kubelet"]).await?;
@@ -1407,6 +1522,63 @@ mod tests {
 
     /// The hidden internal waiter must stay hidden from `--help` so users never
     /// invoke it directly, while still being parseable (asserted above).
+    #[test]
+    fn an_install_is_named_after_its_suffix() {
+        assert_eq!(
+            instance_label(None),
+            "kata-deploy.katacontainers.io/default"
+        );
+        assert_eq!(
+            instance_label(Some("dev")),
+            "kata-deploy.katacontainers.io/dev"
+        );
+    }
+
+    /// The shared label may only be taken away when it is nobody else's.
+    #[test]
+    fn only_another_installs_mark_counts() {
+        let ours = instance_label(Some("dev"));
+        let mark = |keys: &[&str]| -> BTreeMap<String, String> {
+            keys.iter()
+                .map(|key| (key.to_string(), "true".to_string()))
+                .collect()
+        };
+
+        assert_eq!(
+            shared_label_after(&mark(&[&ours]), &ours),
+            SharedLabel::Remove
+        );
+        assert_eq!(
+            shared_label_after(
+                &mark(&[&ours, KATA_RUNTIME_LABEL, "kubernetes.io/hostname"]),
+                &ours
+            ),
+            SharedLabel::Remove,
+            "neither the shared label nor an unrelated one is another install's mark"
+        );
+        assert_eq!(
+            shared_label_after(&mark(&[&ours, &instance_label(None)]), &ours),
+            SharedLabel::Keep
+        );
+        assert_eq!(
+            shared_label_after(&mark(&[&instance_label(Some("prod"))]), &ours),
+            SharedLabel::Keep
+        );
+    }
+
+    /// Another install that has claimed the node but not finished on it must not
+    /// keep it advertised as able to run Kata - and must still be able to find it.
+    #[test]
+    fn an_unfinished_install_holds_the_key_without_the_promise() {
+        let ours = instance_label(Some("dev"));
+        let labels = BTreeMap::from([
+            (ours.clone(), "true".to_string()),
+            (instance_label(None), KATA_RUNTIME_PENDING.to_string()),
+        ]);
+
+        assert_eq!(shared_label_after(&labels, &ours), SharedLabel::Demote);
+    }
+
     #[test]
     fn test_internal_action_is_hidden() {
         let internal = Action::InternalPostInstallWait
