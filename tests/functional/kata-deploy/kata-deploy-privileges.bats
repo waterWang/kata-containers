@@ -249,8 +249,9 @@ EOF
 	echo "${noderole}" | grep -q 'resources: \["nodes"\]'
 	echo "${noderole}" | grep -q 'verbs: \["list", "get", "patch"\]'
 
-	# Nothing beyond nodes and their kubelet proxy, and no verb that could delete
-	# or create one.
+	# Job mode never reasons about DaemonSets: all releases in one cluster use the
+	# same deployment mode.
+	refute_match "${noderole}" 'daemonsets'
 	refute_match "${noderole}" 'pods'
 	refute_match "${noderole}" '"delete"'
 	refute_match "${noderole}" '"create"'
@@ -262,7 +263,7 @@ EOF
 	role=$(rbac_doc "${rbac}" 'kata-deploy-dispatcher-role')
 	[[ -n "${role}" ]]
 	echo "${role}" | grep -q 'resources: \["jobs"\]'
-	echo "${role}" | grep -q 'verbs: \["create", "get", "delete"\]'
+	echo "${role}" | grep -q 'verbs: \["create", "get", "list", "delete"\]'
 	echo "${role}" | grep -q '^kind: Role$'
 }
 
