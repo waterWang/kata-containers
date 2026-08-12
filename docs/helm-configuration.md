@@ -592,7 +592,7 @@ find.
 
 !!! warning "Claiming is best-effort, so this is not a guarantee"
 
-    A node whose claim could not be written (a rejected patch, an apiserver that
+    A node whose claim could not be written (a rejected patch, an API server that
     was unreachable at that moment) carries no label, and the default selector
     cannot see it. If an install failed and you are unsure whether every node was
     reached, name the nodes explicitly under `job.cleanup.nodes`, or widen the
